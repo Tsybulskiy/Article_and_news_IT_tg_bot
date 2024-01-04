@@ -1,116 +1,112 @@
-import json
-import requests
+import asyncio
+import aiomysql
+import aiohttp
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
-import time
-import undetected_chromedriver as uc
-import mysql.connector
+from datetime import datetime
+import json
 
-db = mysql.connector.connect(
-                        host="127.0.0.1",
-                        user="root",
-                        password="12345678",
-                        port="3306",
-                        database="prefinal",
-                        option_files='my.conf',
-                        get_warnings=True
-                    )
 
-def insert_link_into_bd (category,title,link,author,author_link,finally_text,date):
-    cursor = db.cursor(buffered=True)
-    try:
-        syntext = """Insert into links (Category,Title,Article_link,Author,Author_link,Text, DATE) values (%s,%s,%s,%s,%s,%s,%s);"""
-        value = ((category),(title),(link),(author),(author_link),(finally_text),(date))
-        cursor.execute(syntext,value)
-        db.commit()
-    except mysql.connector.Error as err:
-        if err.sqlstate == '23000':
-            raise err
+async def fetch(session, url, headers):
+    async with session.get(url, headers=headers) as response:
+        return await response.text()
 
-def get_safe_surf_ru_data():
+
+async def insert_link_into_db(pool, category, title, link, author, author_link, finally_text, date):
+    async with pool.acquire() as connection:
+        async with connection.cursor() as cursor:
+            try:
+                syntax = """Insert into links (Category, Title, link, Author, Author_link, Text, DATE) values (%s, %s, %s, %s, %s, %s, %s);"""
+                await cursor.execute(syntax, (category, title, link, author, author_link, finally_text, date))
+                await connection.commit()
+            except aiomysql.Error as err:
+                if err.args[0] == 1062:  # Duplicate entry error code
+                    print("Duplicate entry found.")
+                else:
+                    raise
+
+
+async def get_safe_surf_ru_data(loop):
     headers = {
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 YaBrowser/23.1.1.1138 Yowser/2.5 Safari/537.36"
     }
 
-    unique_sites = []
     all_site = []
 
     urls = ['https://safe-surf.ru/article/?PAGEN_1=']
-    for k in urls:
-        for i in range(1, 8):
-            url = f"{k}{i}"
-            print(url)
-            r = requests.get(url=url, headers=headers)
-            soup = BeautifulSoup(r.text, "html.parser")
-            articles_cards = soup.find_all("article", class_="articles__card change-shadow")
-            for card in articles_cards:
-                try:
-                    category = card.find('div', class_="articles__tags tags").find_all('a', class_="articles__tag tag")[
-                        1].text
-                except Exception as ex:
-                    print(ex)
-                    category = "Категория отсутствует"
-                try:
-                    title = card.find('h2').find('a').text
-                except Exception as ex:
-                    print(ex)
-                    title = "Заголовок отсутствует"
-                try:
-                    link = 'https://safe-surf.ru' + card.find('h2').find('a').get('href')
-                except Exception as ex:
-                    print(ex)
-                    link = "Ссылка отсутсвует"
-                try:
-                    resp = requests.get(url=link, headers=headers)
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    finally_text = r''' '''
-                    text = soup.find('div', class_='container article__container').text
-                    for tag in text:
-                        finally_text += ' '.join(tag.splitlines())
-                    finally_text = finally_text.replace('"', '\"')
-                    for i in finally_text:
-                        i = i.replace("'", "\\'")
-                except Exception as ex:
-                    print(ex)
-                    finally_text = "Текст отсутствует"
-                try:
-                    author = soup.find('a', class_='articles__author-link').text
-                except Exception as ex:
-                    author = "Автор отсутствует"
-                try:
-                    author_link = 'https://safe-surf.ru' + soup.find('a', class_="articles__author-link").get('href')
-                except Exception as ex:
-                    author_link = "Cсылка на автора отсутствует"
-                try:
-                    date = card.find('div', class_='item__date').text.strip('\n')
-                    date_list = date.split('.')
-                    day, month, year = date_list[0], date_list[1], date_list[2]
-                    date_time_obj = datetime.strptime((day + '/' + month + '/' + year), '%d/%m/%Y').date()
-                except Exception as ex:
-                    date_time_obj = " "
-                date=date_time_obj
-                insert_link_into_bd(category, title, link, author, author_link, finally_text, date)
-                print('Заголовок -', title)
-                print('Категория -', category)
-                print('Ссылка - ', link)
-                print("Текст статьи:", finally_text)
-                print('Автор:', author)
-                print('Ссылка на автора:', author_link)
-                print('Дата статьи -', date_time_obj)
-                print('===============')
-                all_site.append({'Category': category.capitalize(),
-                                 'Title': title,
-                                 'Article_link': link,
-                                 'Author': author,
-                                 'Author_link': author_link,
-                                 'Text': finally_text,
-                                 'Date': str(date_time_obj)
-                                 })
-                time.sleep(7)
-    for site in all_site:
-        if site not in unique_sites:
-            unique_sites.append(site)
+    pool = await aiomysql.create_pool(
+        host="127.0.0.1",
+        user="root",
+        password="12345678",
+        port=3306,
+        db="bot",
+        loop=loop
+    )
+
+    async with aiohttp.ClientSession() as session:
+        for base_url in urls:
+            for i in range(1, 8):
+                url = f"{base_url}{i}"
+                print(url)
+                page_html = await fetch(session, url, headers)
+
+                soup = BeautifulSoup(page_html, "html.parser")
+                articles_cards = soup.find_all("article", class_="articles__card change-shadow")
+
+                for card in articles_cards:
+                    category = card.find('div', class_="articles__tags tags") \
+                        .find('a', class_="articles__tag tag").text \
+                        if card.find('div', class_="articles__tags tags") else "Категория отсутствует"
+                    title = card.find('h2').find('a').text if card.find('h2') else "Заголовок отсутствует"
+                    link = 'https://safe-surf.ru' + card.find('h2').find('a').get('href') if card.find(
+                        'h2') else "Ссылка отсутсвует"
+
+                    article_html = await fetch(session, link, headers)
+                    article_soup = BeautifulSoup(article_html, "html.parser")
+                    text = article_soup.find('div', class_='container article__container').text if article_soup.find(
+                        'div', class_='container article__container') else "Текст отсутствует"
+                    cleaned_text = ' '.join(text.splitlines()).replace('"', '\\"').replace("'", "\\'")
+
+                    author = article_soup.find('a', class_='articles__author-link').text if article_soup.find('a',
+                                                                                                              class_='articles__author-link') else "Автор отсутствует"
+                    author_link = 'https://safe-surf.ru' + article_soup.find('a', class_="articles__author-link").get(
+                        'href') if article_soup.find('a',
+                                                     class_='articles__author-link') else "Cсылка на автора отсутствует"
+
+                    date_text = card.find('div', class_='item__date').text.strip('\n') if card.find('div',
+                                                                                                    class_='item__date') else None
+                    date_list = date_text.split('.') if date_text else None
+                    date_time_obj = datetime.strptime('/'.join(date_list), '%d/%m/%Y').date() if date_list else None
+
+                    await insert_link_into_db(pool, category, title, link, author, author_link, cleaned_text,
+                                              date_time_obj)
+
+                    print('Заголовок:', title)
+                    print('Категория:', category)
+                    print('Ссылка:', link)
+                    print('Текст статьи:', cleaned_text)
+                    print('Автор:', author)
+                    print('Ссылка на автора:', author_link)
+                    print('Дата статьи:', date_time_obj)
+                    print('===============')
+
+                    data = {
+                        'Category': category.capitalize(),
+                        'Title': title,
+                        'Article_link': link,
+                        'Author': author,
+                        'Author_link': author_link,
+                        'Text': cleaned_text,
+                        'Date': date_time_obj.strftime('%Y-%m-%d') if date_time_obj else None
+                    }
+                    all_site.append(data)
+
+                    await asyncio.sleep(7)
+    pool.close()
+    await pool.wait_closed()
+
     with open('safe-surf_ru.json', 'w', encoding="utf-8") as file:
         json.dump(all_site, file, indent=4, ensure_ascii=False)
 
-get_safe_surf_ru_data()
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(get_safe_surf_ru_data(loop))
